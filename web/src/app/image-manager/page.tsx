@@ -14,6 +14,7 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
+import { formatImageLocalTime, imageLocalDate } from "@/lib/image-local-time";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
@@ -25,6 +26,10 @@ function formatSize(size: number) {
 
 function imageKey(item: ManagedImage) {
   return item.rel || item.url;
+}
+
+function localDate(item: ManagedImage) {
+  return imageLocalDate(item.created_at, item.date);
 }
 
 function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
@@ -93,9 +98,13 @@ function ImageManagerContent() {
   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | "byDate" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
 
+  const dateFilteredItems = items.filter((item) => {
+    const date = localDate(item);
+    return (!startDate || date >= startDate) && (!endDate || date <= endDate);
+  });
   const filteredItems = selectedTags.length > 0
-    ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
-    : items;
+    ? dateFilteredItems.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
+    : dateFilteredItems;
 
   const lightboxImages = filteredItems.map((item) => ({
     id: item.name,
@@ -108,7 +117,7 @@ function ImageManagerContent() {
   const safePage = Math.min(page, pageCount);
   const currentRows = filteredItems.slice((safePage - 1) * pageSize, safePage * pageSize);
   const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
-  const selectedCount = deleteMode === "filtered" ? items.length : deleteMode === "byDate" ? 0 : selectedPaths.length;
+  const selectedCount = deleteMode === "filtered" ? dateFilteredItems.length : deleteMode === "byDate" ? 0 : selectedPaths.length;
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
   const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
 
@@ -116,12 +125,15 @@ function ImageManagerContent() {
     setIsLoading(true);
     try {
       const [data, tagsData] = await Promise.all([
-        fetchManagedImages({ start_date: startDate, end_date: endDate }),
+        fetchManagedImages({}),
         fetchImageTags(),
       ]);
       setItems(data.items);
       setAllTags(tagsData.tags);
-      setSelectedPaths((current) => current.filter((path) => data.items.some((item) => imageKey(item) === path)));
+      setSelectedPaths((current) => current.filter((path) => data.items.some((item) => {
+        const date = localDate(item);
+        return imageKey(item) === path && (!startDate || date >= startDate) && (!endDate || date <= endDate);
+      })));
       setPage(1);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "加载图片失败");
@@ -238,7 +250,8 @@ function ImageManagerContent() {
     if (!deleteMode || selectedCount === 0) return;
     setIsDeleting(true);
     try {
-      const data = await deleteManagedImages(deleteMode === "filtered" ? { start_date: startDate, end_date: endDate, all_matching: true } : { paths: selectedPaths });
+      const paths = deleteMode === "filtered" ? dateFilteredItems.map((item) => item.rel) : selectedPaths;
+      const data = await deleteManagedImages({ paths });
       toast.success(`已删除 ${data.removed} 张图片`);
       setDeleteMode(null);
       setSelectedPaths([]);
@@ -251,7 +264,7 @@ function ImageManagerContent() {
   };
 
   const handleBatchDownload = async () => {
-    const paths = deleteMode === "filtered" ? items.map((item) => item.rel) : selectedPaths;
+    const paths = deleteMode === "filtered" ? dateFilteredItems.map((item) => item.rel) : selectedPaths;
     if (paths.length === 0) return;
     setIsDownloading(true);
     try {
@@ -288,7 +301,7 @@ function ImageManagerContent() {
             {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
             查询
           </Button>
-          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || items.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
+          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || dateFilteredItems.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
             <Trash2 className="size-4" />
             删除匹配日期
           </Button>
@@ -422,7 +435,9 @@ function ImageManagerContent() {
                 if (!deleteStartDate) return;
                 try {
                   setIsDeleting(true);
-                  const r = await deleteManagedImages({ end_date: deleteStartDate, all_matching: true });
+                  const images = await fetchManagedImages({});
+                  const paths = images.items.filter((item) => localDate(item) <= deleteStartDate).map((item) => item.rel);
+                  const r = await deleteManagedImages({ paths });
                   toast.success(`已删除 ${r.removed} 张图片`);
                   setDeleteMode(null);
                   void loadStorage();
@@ -443,7 +458,7 @@ function ImageManagerContent() {
             <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
               <ImageIcon className="size-4" />
               共 {filteredItems.length} 张
-              {selectedTags.length > 0 ? <span className="text-stone-400">（筛选自 {items.length} 张）</span> : null}
+              {selectedTags.length > 0 ? <span className="text-stone-400">（筛选自 {dateFilteredItems.length} 张）</span> : null}
               <label className="flex items-center gap-2">
                 <Checkbox className={IMAGE_MANAGER_CHECKBOX_CLASS} checked={currentPageSelected} onCheckedChange={(checked) => togglePaths(currentRows.map(imageKey), Boolean(checked))} />
                 本页全选
@@ -516,7 +531,7 @@ function ImageManagerContent() {
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-1 font-medium text-stone-700">
                       <CalendarDays className="size-3.5" />
-                      {item.created_at}
+                      {formatImageLocalTime(item.created_at)}
                     </div>
                     <div className="flex items-center gap-1">
                       <Button
@@ -651,7 +666,7 @@ function ImageManagerContent() {
               />
               <div className="min-w-0 overflow-hidden text-xs text-stone-500">
                 <div className="truncate font-medium text-stone-700">{deleteTarget.name}</div>
-                <div className="truncate">{deleteTarget.created_at}</div>
+                <div className="truncate">{formatImageLocalTime(deleteTarget.created_at)}</div>
                 <div>{formatSize(deleteTarget.size)}</div>
               </div>
             </div>
