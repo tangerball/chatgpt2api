@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 import time
 from urllib.parse import urlsplit
@@ -14,6 +15,7 @@ from services.storage.base import StorageBackend
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
+EXTERNAL_UPSTREAM_FILE = DATA_DIR / "external_upstream.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
@@ -644,8 +646,10 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def get_external_upstream_settings(self) -> dict[str, object]:
-        stored = self.data.get("external_upstream")
-        return {**DEFAULT_EXTERNAL_UPSTREAM, **(stored if isinstance(stored, dict) else {})}
+        return {
+            **DEFAULT_EXTERNAL_UPSTREAM,
+            **_read_json_object(EXTERNAL_UPSTREAM_FILE, name="external_upstream.json"),
+        }
 
     def get_public_external_upstream_settings(self) -> dict[str, object]:
         settings = self.get_external_upstream_settings()
@@ -655,13 +659,23 @@ class ConfigStore:
             "has_api_key": bool(settings["api_key"]),
         }
 
+    def update_external_upstream_settings(self, value: dict[str, object]) -> dict[str, object]:
+        settings = _normalize_external_upstream_settings(value, self.get_external_upstream_settings())
+        EXTERNAL_UPSTREAM_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(prefix=".external-upstream-", dir=EXTERNAL_UPSTREAM_FILE.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(settings, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+            os.replace(temporary_path, EXTERNAL_UPSTREAM_FILE)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        return self.get_public_external_upstream_settings()
+
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
-        if "external_upstream" in data:
-            next_data["external_upstream"] = _normalize_external_upstream_settings(
-                data["external_upstream"], self.data.get("external_upstream")
-            )
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

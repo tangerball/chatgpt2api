@@ -110,10 +110,10 @@ def create_router(app_version: str) -> APIRouter:
     async def save_external_upstream(body: ExternalUpstreamUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            config.update({"external_upstream": body.model_dump(mode="python")})
+            upstream = config.update_external_upstream_settings(body.model_dump(mode="python"))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {"upstream": config.get_public_external_upstream_settings()}
+        return {"upstream": upstream}
 
     @router.get("/api/images")
     async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
@@ -27,9 +29,11 @@ class ExternalUpstreamTests(unittest.TestCase):
         original_data = config.data
         config.data = copy.deepcopy(original_data)
         self.addCleanup(setattr, config, "data", original_data)
-        save_patcher = mock.patch.object(config, "_save")
-        save_patcher.start()
-        self.addCleanup(save_patcher.stop)
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        file_patcher = mock.patch("services.config.EXTERNAL_UPSTREAM_FILE", Path(temporary.name) / "external_upstream.json")
+        file_patcher.start()
+        self.addCleanup(file_patcher.stop)
 
         self.requests: list[tuple[httpx.Request, bytes]] = []
         self.upstream_status = 200
