@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 import copy
+import io
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,10 +16,12 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from api import ai, system
 from services import external_upstream
 from services.config import config
+from services.image_storage_service import image_storage_service
 
 
 LOCAL_KEY = os.environ["CHATGPT2API_AUTH_KEY"]
@@ -34,15 +39,28 @@ class ExternalUpstreamTests(unittest.TestCase):
         file_patcher = mock.patch("services.config.EXTERNAL_UPSTREAM_FILE", Path(temporary.name) / "external_upstream.json")
         file_patcher.start()
         self.addCleanup(file_patcher.stop)
+        data_patcher = mock.patch("services.config.DATA_DIR", Path(temporary.name))
+        data_patcher.start()
+        self.addCleanup(data_patcher.stop)
+        index_patcher = mock.patch.object(image_storage_service, "index_file", Path(temporary.name) / "image_index.json")
+        index_patcher.start()
+        self.addCleanup(index_patcher.stop)
+        config.data["image_storage"] = {"mode": "local"}
 
         self.requests: list[tuple[httpx.Request, bytes]] = []
         self.upstream_status = 200
         self.upstream_headers = {"content-type": "application/json"}
         self.upstream_content = b'{"object":"list","data":[{"id":"remote-model"}]}'
+        self.upstream_image_content: bytes | None = None
         self.upstream_error = False
 
         async def handle(request: httpx.Request) -> httpx.Response:
             self.requests.append((request, await request.aread()))
+            if request.url.path.startswith("/images/"):
+                return httpx.Response(
+                    200 if self.upstream_image_content is not None else 404,
+                    content=self.upstream_image_content or b"",
+                )
             if self.upstream_error:
                 raise httpx.ConnectError("unavailable", request=request)
             return httpx.Response(
@@ -73,6 +91,17 @@ class ExternalUpstreamTests(unittest.TestCase):
         app.include_router(ai.create_router())
         app.include_router(system.create_router("test"))
         self.client = TestClient(app)
+
+    @staticmethod
+    def image_bytes(format: str = "PNG") -> bytes:
+        output = io.BytesIO()
+        Image.new("RGB", (2, 2), "red").save(output, format=format)
+        return output.getvalue()
+
+    def image_items(self) -> list[dict[str, object]]:
+        response = self.client.get("/api/images", headers=LOCAL_AUTH)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["items"]
 
     def configure(self):
         response = self.client.post(
@@ -139,6 +168,88 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertIn("multipart/form-data", forwarded.headers["content-type"])
         self.assertIn(b"image-bytes", body)
         self.assertIn(b"source.png", body)
+
+    def test_base64_image_is_saved_without_changing_upstream_response(self):
+        self.configure()
+        image = self.image_bytes()
+        self.upstream_content = json.dumps({"data": [{
+            "b64_json": base64.b64encode(image).decode(),
+            "url": "http://upstream.example:6679/images/remote.png",
+        }]}).encode()
+
+        response = self.client.post(
+            "/v1/images/generations",
+            headers=LOCAL_AUTH,
+            json={"model": "remote-model", "prompt": "red square"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, self.upstream_content)
+        self.assertEqual(len(self.requests), 1)
+        items = self.image_items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(image_storage_service.get_bytes(items[0]["path"]), image)
+
+    def test_same_origin_image_url_is_saved_as_png(self):
+        self.configure()
+        self.upstream_image_content = self.image_bytes("JPEG")
+        self.upstream_content = json.dumps({"data": [{
+            "url": "http://upstream.example:6679/images/2026/11/03/remote.jpg",
+        }]}).encode()
+
+        response = self.client.post(
+            "/v1/images/edits", headers=LOCAL_AUTH,
+            data={"model": "remote-model", "prompt": "red square"},
+            files={"image": ("source.png", self.image_bytes(), "image/png")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, self.upstream_content)
+        self.assertEqual([request.method for request, _ in self.requests], ["POST", "GET"])
+        items = self.image_items()
+        self.assertEqual(len(items), 1)
+        saved = image_storage_service.get_bytes(items[0]["path"])
+        with Image.open(io.BytesIO(saved)) as image:
+            self.assertEqual(image.format, "PNG")
+
+    def test_untrusted_image_url_and_upstream_errors_are_not_saved(self):
+        self.configure()
+        self.upstream_content = json.dumps({"data": [{
+            "url": "http://other.example/images/remote.png",
+        }]}).encode()
+        response = self.client.post(
+            "/v1/images/generations", headers=LOCAL_AUTH,
+            json={"model": "remote-model", "prompt": "red square"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.image_items(), [])
+
+        self.upstream_status = 429
+        self.upstream_content = json.dumps({"data": [{
+            "b64_json": base64.b64encode(self.image_bytes()).decode(),
+        }]}).encode()
+        response = self.client.post(
+            "/v1/images/generations", headers=LOCAL_AUTH,
+            json={"model": "remote-model", "prompt": "red square"},
+        )
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(self.image_items(), [])
+
+    def test_storage_failure_does_not_change_upstream_response(self):
+        self.configure()
+        self.upstream_content = json.dumps({"data": [{
+            "b64_json": base64.b64encode(self.image_bytes()).decode(),
+        }]}).encode()
+        with mock.patch.object(image_storage_service, "save", side_effect=OSError("full")):
+            with self.assertLogs(external_upstream.logger, level="ERROR"):
+                response = self.client.post(
+                    "/v1/images/generations", headers=LOCAL_AUTH,
+                    json={"model": "remote-model", "prompt": "red square"},
+                )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, self.upstream_content)
+        self.assertEqual(self.image_items(), [])
 
     def test_stream_and_upstream_error_status_are_preserved(self):
         self.configure()
