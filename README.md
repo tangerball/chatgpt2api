@@ -61,6 +61,12 @@ docker compose up -d
 - API 地址：`http://localhost:3000/v1`
 - 数据目录：`./data`
 
+### 外部模型上游
+
+管理员可在「设置 → 模型上游」填写另一个 OpenAI 兼容服务的根地址和 API Key，并开启转发。保存后立即生效；关闭后继续使用本地账号池。调用者仍需使用本机 ChatGPT2API 的密钥，服务端校验后才会向上游发送请求，上游 Key 不会返回给浏览器。
+
+转发范围为 `/v1/models`、`/v1/images/generations`、`/v1/images/edits`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 和 `/v1/search`。管理接口、内置画图任务和账号池保持本机处理。上游 Key 保存在 `config.json`，部署时应限制该文件的读取权限，不要把含密钥的配置提交到 Git。
+
 ### WARP / FlareSolverr 稳定代理部署
 
 如果图片链路经常遇到 Cloudflare 拦截，可以启用附带的 WARP + Privoxy + FlareSolverr 方案：
