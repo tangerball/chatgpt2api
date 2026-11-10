@@ -30,6 +30,8 @@ MAX_MIRROR_RESPONSE_BYTES = 128 * 1024 * 1024
 MAX_MIRROR_IMAGE_BYTES = 64 * 1024 * 1024
 UPSTREAM_MODEL_PREFIX = "upstream/"
 MODEL_CATALOG_TTL_SECONDS = 60
+LEGACY_GPT_IMAGE_MODELS = {"gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5", "gpt-image-2"}
+COMPLEXITY_IMAGE_MODELS = ("gpt-image-2.5-sunburst", "gpt-image-2.5-flare")
 _model_catalog_lock = RLock()
 _model_catalog_cache: dict[str, object] = {"base_url": "", "expires_at": 0.0, "models": {}}
 
@@ -163,6 +165,29 @@ async def _mirror_images(body: bytes, base_url: str) -> None:
                 logger.exception("Could not save an external upstream image")
 
 
+def _valid_image_response(body: bytes) -> bool:
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and any(isinstance(item.get(field), str) and item[field].strip() for field in ("url", "b64_json"))
+        for item in payload["data"]
+    )
+
+
+async def _read_limited(response: httpx.Response, limit: int) -> bytes | None:
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > limit:
+            return None
+        body.extend(chunk)
+    return bytes(body)
+
+
 async def forward(request: Request, upstream: dict[str, object], request_body: bytes | None = None):
     from api.support import require_identity
 
@@ -201,15 +226,34 @@ async def forward(request: Request, upstream: dict[str, object], request_body: b
         await client.aclose()
         return JSONResponse(status_code=502, content={"error": "External model upstream unavailable"})
 
-    if request.url.path in IMAGE_ENDPOINTS and response.status_code >= 400:
+    if request.url.path in IMAGE_ENDPOINTS:
         try:
-            error_body = await response.aread()
+            response_body = await _read_limited(response, MAX_MIRROR_RESPONSE_BYTES)
             error_headers = {
                 name: value
                 for name in ("content-type", "retry-after")
                 if (value := response.headers.get(name))
             }
-            return Response(content=error_body, status_code=response.status_code, headers=error_headers)
+            if response_body is None:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": "External image upstream response exceeded the size limit"},
+                )
+            if response.status_code >= 400:
+                return Response(content=response_body, status_code=response.status_code, headers=error_headers)
+            if not _valid_image_response(response_body):
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": "External image upstream returned an invalid image response"},
+                )
+            return Response(
+                content=response_body,
+                status_code=response.status_code,
+                headers=error_headers,
+                background=BackgroundTask(_mirror_images, response_body, base_url),
+            )
+        except httpx.RequestError:
+            return JSONResponse(status_code=502, content={"error": "External model upstream unavailable"})
         finally:
             await response.aclose()
             await client.aclose()
@@ -417,6 +461,42 @@ def _upstream_image_error(response: Response, api_key: str) -> str:
     return f"External image upstream returned HTTP {response.status_code}: {message}"
 
 
+def _image_complexity_rejected(status: int, body: bytes, model: str) -> bool:
+    """Recognize the gateway's incompatible legacy-model complexity default."""
+    if status != 400 or model not in LEGACY_GPT_IMAGE_MODELS:
+        return False
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("param") == "complexity"
+        and error.get("code") == "invalid_value"
+        and isinstance(error.get("message"), str)
+        and re.fullmatch(r"Complexity '[^']+' is not supported for this image model\.", error["message"].strip()) is not None
+    )
+
+
+def _complexity_retry_model(models: dict[str, object] | None) -> str | None:
+    return next((model for model in COMPLEXITY_IMAGE_MODELS if model in (models or {})), None)
+
+
+def _sync_complexity_retry_model(client: httpx.Client, base_url: str, headers: dict[str, str]) -> str | None:
+    try:
+        response = client.get(base_url + "/v1/models", headers=headers)
+        payload = response.json()
+        if response.is_error or not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            return None
+        return _complexity_retry_model({
+            item["id"]: item for item in payload["data"]
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        })
+    except (httpx.RequestError, ValueError):
+        return None
+
+
 def handle_image_task(payload: dict[str, object], mode: str) -> dict[str, object] | None:
     """Route the web image-task workflow to the external provider when its model is selected."""
     upstream = config.get_external_upstream_settings()
@@ -455,18 +535,27 @@ def handle_image_task(payload: dict[str, object], mode: str) -> dict[str, object
                 ]
                 if not files:
                     raise RuntimeError("image is required")
-                response = client.post(
-                    base_url + endpoint,
-                    headers=headers,
-                    data=fields,
-                    files=files,
-                )
-            else:
-                response = client.post(
-                    base_url + endpoint,
-                    headers={**headers, "Content-Type": "application/json"},
-                    json=fields,
-                )
+            # Retry only an explicit parameter rejection, never a successful or
+            # ambiguous request (which could generate and bill another image).
+            for attempt in range(2):
+                if mode == "edit":
+                    response = client.post(base_url + endpoint, headers=headers, data=fields, files=files)
+                else:
+                    response = client.post(
+                        base_url + endpoint,
+                        headers={**headers, "Content-Type": "application/json"},
+                        json=fields,
+                    )
+                if attempt or not _image_complexity_rejected(response.status_code, response.content, model):
+                    break
+                retry_model = _sync_complexity_retry_model(client, base_url, headers)
+                if retry_model is None:
+                    break
+                logger.warning({
+                    "event": "external_image_complexity_retry", "path": endpoint,
+                    "model": model, "retry_model": retry_model,
+                })
+                fields["model"] = retry_model
     except httpx.RequestError as exc:
         logger.warning({"event": "external_image_task_failed", "error_type": type(exc).__name__})
         raise RuntimeError("External model upstream unavailable") from exc
@@ -546,6 +635,20 @@ class ExternalUpstreamMiddleware:
 
         forwarded_request = Request(scope, _replay_body(upstream_body, receive))
         response = await forward(forwarded_request, upstream, upstream_body)
+        if image_request and _image_complexity_rejected(response.status_code, getattr(response, "body", b""), model):
+            retry_model = _complexity_retry_model(await _fetch_upstream_models(upstream))
+            retry_body = _replace_model_in_body(
+                upstream_body, request.headers.get("content-type", ""), retry_model,
+            ) if retry_model else None
+            if retry_body is not None:
+                logger.warning({
+                    "event": "external_image_complexity_retry", "path": path,
+                    "model": model, "retry_model": retry_model,
+                })
+                retry_request = Request(scope, _replay_body(retry_body, receive))
+                response = await forward(retry_request, upstream, retry_body)
+                response.headers["X-Image-Requested-Model"] = model
+                response.headers["X-Image-Upstream-Model"] = retry_model
         if image_request and response.status_code >= 400:
             upstream_error = _upstream_image_error(response, str(upstream.get("api_key") or ""))
             local_model_ids = await _local_model_ids()

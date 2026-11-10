@@ -184,6 +184,7 @@ class ExternalUpstreamTests(unittest.TestCase):
 
     def test_multipart_upload_is_forwarded_without_reencoding(self):
         self.configure()
+        self.upstream_content = b'{"data":[{"url":"https://upstream.example/image.png"}]}'
         response = self.client.post(
             "/v1/images/edits?trace=1",
             headers=LOCAL_AUTH,
@@ -454,6 +455,7 @@ class ExternalUpstreamTests(unittest.TestCase):
 
     def test_multipart_upstream_alias_is_stripped_without_changing_file_parts(self):
         self.configure()
+        self.upstream_content = b'{"data":[{"url":"https://upstream.example/image.png"}]}'
         response = self.client.post(
             "/v1/images/edits",
             headers=LOCAL_AUTH,
