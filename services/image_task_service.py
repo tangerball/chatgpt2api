@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -18,6 +19,7 @@ TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
+logger = logging.getLogger(__name__)
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 
@@ -259,9 +261,19 @@ class ImageTaskService:
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
-            result = handle_image_task(payload, mode)
+            try:
+                result = handle_image_task(payload, mode)
+                if result is not None and (not isinstance(result, dict) or not isinstance(result.get("data"), list) or not result["data"]):
+                    raise RuntimeError("external upstream returned no images")
+            except Exception as exc:
+                logger.warning({"event": "external_image_task_fallback", "error_type": type(exc).__name__})
+                result = None
             if result is None:
-                result = handler(payload_with_progress)
+                local_payload = dict(payload_with_progress)
+                model_name = _clean(local_payload.get("model"))
+                if model_name.startswith("upstream/"):
+                    local_payload["model"] = model_name.removeprefix("upstream/")
+                result = handler(local_payload)
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")

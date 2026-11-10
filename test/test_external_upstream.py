@@ -197,6 +197,40 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertIn(b"image-bytes", body)
         self.assertIn(b"source.png", body)
 
+    def test_image_generation_prefers_external_upstream_for_local_model_collision(self):
+        self.configure()
+        self.upstream_content = b'{"data":[{"url":"https://upstream.example/image.png"}]}'
+
+        response = self.client.post(
+            "/v1/images/generations",
+            headers=LOCAL_AUTH,
+            json={"model": "local-model", "prompt": "red square", "n": 1},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.requests), 1)
+        forwarded, body = self.requests[0]
+        self.assertEqual(str(forwarded.url), "http://upstream.example:6679/v1/images/generations")
+        self.assertEqual(json.loads(body)["model"], "local-model")
+
+    def test_image_generation_falls_back_to_local_when_external_upstream_fails(self):
+        self.configure()
+        self.upstream_status = 503
+        self.upstream_content = b'{"error":{"message":"upstream unavailable"}}'
+        local_result = {"data": [{"url": "https://local.example/image.png"}]}
+        with mock.patch.object(ai.openai_v1_image_generations, "handle", return_value=local_result) as local_handler:
+            response = self.client.post(
+                "/v1/images/generations",
+                headers=LOCAL_AUTH,
+                json={"model": "local-model", "prompt": "red square", "n": 1},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), local_result)
+        self.assertEqual(len(self.requests), 1)
+        local_handler.assert_called_once()
+        self.assertEqual(local_handler.call_args.args[0]["model"], "local-model")
+
     def test_base64_image_is_saved_without_changing_upstream_response(self):
         self.configure()
         image = self.image_bytes()
@@ -261,7 +295,7 @@ class ExternalUpstreamTests(unittest.TestCase):
             "/v1/images/generations", headers=LOCAL_AUTH,
             json={"model": "remote-model", "prompt": "red square"},
         )
-        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.status_code, 502)
         self.assertEqual(self.image_items(), [])
 
     def test_storage_failure_does_not_change_upstream_response(self):
@@ -418,6 +452,7 @@ class ExternalUpstreamTests(unittest.TestCase):
             result = external_upstream.handle_image_task({
                 "model": "gpt-image-2.5-sunburst",
                 "prompt": "red square",
+                "n": "2",
                 "size": "1024x1024",
                 "base_url": "https://canvas.example",
             }, "generate")
@@ -428,6 +463,8 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertEqual(request.headers["authorization"], f"Bearer {REMOTE_KEY}")
         request_payload = json.loads(body)
         self.assertEqual(request_payload["model"], "gpt-image-2.5-sunburst")
+        self.assertIsInstance(request_payload["n"], int)
+        self.assertEqual(request_payload["n"], 2)
         self.assertEqual(request_payload["response_format"], "b64_json")
         self.assertIsNotNone(result)
         self.assertNotIn("b64_json", result["data"][0])
@@ -436,10 +473,18 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(image_storage_service.get_bytes(items[0]["path"]), image)
 
-    def test_image_task_local_model_stays_on_local_handler(self):
+    def test_image_task_uses_upstream_first_even_when_model_is_available_locally(self):
         self.configure()
-        result = external_upstream.handle_image_task({"model": "local-model", "prompt": "local"}, "generate")
-        self.assertIsNone(result)
+        real_client = httpx.Client
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"data": [{"url": "https://upstream.example/image.png"}]}))
+        with mock.patch.object(
+            external_upstream.httpx,
+            "Client",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ):
+            result = external_upstream.handle_image_task({"model": "local-model", "prompt": "local"}, "generate")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["data"][0]["url"], "https://upstream.example/image.png")
 
     def test_image_task_edit_forwards_multipart_to_external_provider(self):
         self.configure()

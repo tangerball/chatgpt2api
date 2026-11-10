@@ -147,6 +147,7 @@ function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
 function filterImageModels(items: Model[]): ImageModel[] {
   return items
     .map((item) => String(item.id || "").trim())
+    .filter((id) => !id.startsWith("upstream/"))
     .filter((id, index, list) => id.toLowerCase().includes("image") && list.indexOf(id) === index);
 }
 

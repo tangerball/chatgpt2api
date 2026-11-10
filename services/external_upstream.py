@@ -354,30 +354,15 @@ def handle_image_task(payload: dict[str, object], mode: str) -> dict[str, object
         return None
 
     requested_model = str(payload.get("model") or "gpt-image-2")
-    explicit_upstream = requested_model.startswith(UPSTREAM_MODEL_PREFIX)
-    model = requested_model[len(UPSTREAM_MODEL_PREFIX):] if explicit_upstream else requested_model
-    try:
-        local_catalog = list_local_models()
-        local_items = local_catalog.get("data", []) if isinstance(local_catalog, dict) else []
-        local_models = {
-            str(item.get("id") or "").strip()
-            for item in local_items
-            if isinstance(item, dict) and str(item.get("id") or "").strip()
-        } if isinstance(local_items, list) else set()
-    except Exception as exc:  # noqa: BLE001 - an explicit external selection remains usable without local discovery
-        logger.warning({"event": "local_model_catalog_failed", "error_type": type(exc).__name__})
-        local_models = set()
-
-    if not explicit_upstream and model in local_models:
-        return None
+    model = requested_model.removeprefix(UPSTREAM_MODEL_PREFIX)
 
     base_url = str(upstream["base_url"])
     api_key = str(upstream["api_key"])
     endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
-    fields: dict[str, str] = {
+    fields: dict[str, object] = {
         "prompt": str(payload.get("prompt") or ""),
         "model": model,
-        "n": str(payload.get("n") or 1),
+        "n": int(payload.get("n") or 1),
         "quality": str(payload.get("quality") or "auto"),
         "response_format": "b64_json",
     }
@@ -476,7 +461,8 @@ class ExternalUpstreamMiddleware:
             body,
             request.headers.get("content-type", ""),
         )
-        if path == "/v1/search" or explicit_upstream:
+        image_request = path in IMAGE_ENDPOINTS
+        if path == "/v1/search" or explicit_upstream or image_request:
             use_external = True
         else:
             local_models = await _local_model_ids()
@@ -488,4 +474,16 @@ class ExternalUpstreamMiddleware:
 
         forwarded_request = Request(scope, _replay_body(upstream_body, receive))
         response = await forward(forwarded_request, upstream)
+        if image_request and response.status_code >= 400:
+            body_iterator = getattr(response, "body_iterator", None)
+            close_iterator = getattr(body_iterator, "aclose", None)
+            if close_iterator is not None:
+                await close_iterator()
+            logger.warning({
+                "event": "external_image_request_fallback",
+                "path": path,
+                "upstream_status": response.status_code,
+            })
+            await self.app(scope, _replay_body(upstream_body, receive), send)
+            return
         await response(scope, receive, send)

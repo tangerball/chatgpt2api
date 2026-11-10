@@ -134,6 +134,30 @@ class ImageTaskServiceTests(unittest.TestCase):
             external_handler.assert_called_once()
             self.assertEqual(external_handler.call_args.args[1], "generate")
 
+    def test_failed_external_image_task_falls_back_to_local_with_plain_model_id(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_result = {"data": [{"url": "https://local.test/images/generated.png"}]}
+            local_handler = mock.Mock(return_value=local_result)
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=local_handler,
+                edit_handler=local_handler,
+                retention_days_getter=lambda: 30,
+            )
+            with mock.patch("services.image_task_service.handle_image_task", side_effect=RuntimeError("invalid n field type")):
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="fallback-image-task",
+                    prompt="cup",
+                    model="upstream/gpt-image-2",
+                    size="1024x1024",
+                    base_url="https://local.test",
+                )
+                task = wait_for_task(service, OWNER, "fallback-image-task", "success")
+
+            self.assertEqual(task["data"], local_result["data"])
+            self.assertEqual(local_handler.call_args.args[0]["model"], "gpt-image-2")
+
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
