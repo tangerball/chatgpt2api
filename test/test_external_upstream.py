@@ -194,6 +194,8 @@ class ExternalUpstreamTests(unittest.TestCase):
         forwarded, body = self.requests[0]
         self.assertEqual(forwarded.url.query, b"trace=1")
         self.assertIn("multipart/form-data", forwarded.headers["content-type"])
+        self.assertEqual(int(forwarded.headers["content-length"]), len(body))
+        self.assertNotIn("transfer-encoding", forwarded.headers)
         self.assertIn(b"image-bytes", body)
         self.assertIn(b"source.png", body)
 
@@ -235,6 +237,39 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
         local_handler.assert_called_once()
         self.assertEqual(local_handler.call_args.args[0]["model"], "gpt-image-2")
+
+    def test_image_edit_reports_upstream_rejection_when_local_quota_is_empty(self):
+        self.configure()
+        self.upstream_status = 400
+        self.upstream_content = b'{"error":{"message":"provider accepts only one reference image"}}'
+        with (
+            mock.patch.object(external_upstream, "list_local_models", return_value={
+                "object": "list", "data": [{"id": "gpt-image-2"}],
+            }),
+            mock.patch.object(
+                ai.openai_v1_image_edit,
+                "handle",
+                side_effect=RuntimeError("no available image quota"),
+            ),
+        ):
+            response = self.client.post(
+                "/v1/images/edits",
+                headers=LOCAL_AUTH,
+                data={"model": "gpt-image-2.5-sunburst", "prompt": "change color"},
+                files=[
+                    ("image[]", ("first.png", b"first-image", "image/png")),
+                    ("image[]", ("second.png", b"second-image", "image/png")),
+                ],
+            )
+
+        self.assertEqual(response.status_code, 429, response.text)
+        message = response.json()["error"]["message"]
+        self.assertIn("HTTP 400", message)
+        self.assertIn("provider accepts only one reference image", message)
+        self.assertIn("local fallback failed: no available image quota", message)
+        forwarded, body = self.requests[0]
+        self.assertEqual(str(forwarded.url), "http://upstream.example:6679/v1/images/edits")
+        self.assertEqual(body.count(b'name="image[]"'), 2)
 
     def test_base64_image_is_saved_without_changing_upstream_response(self):
         self.configure()

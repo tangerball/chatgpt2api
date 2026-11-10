@@ -179,15 +179,17 @@ def _request_excerpt(text: object, limit: int = 1000) -> str:
     return normalized[: limit - 1].rstrip() + "…"
 
 
-def _image_error_response(exc: Exception) -> JSONResponse:
+def _image_error_response(exc: Exception, error_context: str = "") -> JSONResponse:
     from services.protocol.conversation import public_image_error_message
 
     message = public_image_error_message(str(exc))
+    if error_context:
+        message = f"{error_context}; local fallback failed: {message}"
     if "no available image quota" in message.lower():
         return openai_error_response(
             {
                 "error": {
-                    "message": "no available image quota",
+                    "message": message,
                     "type": "insufficient_quota",
                     "param": None,
                     "code": "insufficient_quota",
@@ -223,6 +225,7 @@ class LoggedCall:
     started: float = field(default_factory=time.time)
     request_text: str = ""
     request_shape: dict[str, int] | None = None
+    error_context: str = ""
 
     async def run(self, handler, *args, sse: str = "openai"):
         from services.protocol.conversation import ImageGenerationError
@@ -230,16 +233,18 @@ class LoggedCall:
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+            error = self._error_message(exc)
+            self.log("调用失败", status="failed", error=error, account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""))
-            return _image_error_response(exc)
+            return _image_error_response(exc, self.error_context)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            error = self._error_message(exc)
+            self.log("调用失败", status="failed", error=error, account_email=getattr(exc, "account_email", ""))
             if self.endpoint.startswith("/v1/images"):
-                return _image_error_response(exc)
+                return _image_error_response(exc, self.error_context)
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
@@ -267,6 +272,12 @@ class LoggedCall:
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
+
+    def _error_message(self, exc: Exception) -> str:
+        message = str(exc)
+        if self.error_context:
+            return f"{self.error_context}; local fallback failed: {message}"
+        return message
 
     def stream(self, items):
         urls: list[str] = []

@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Receive, Scope, Send
 from PIL import Image
@@ -163,7 +163,7 @@ async def _mirror_images(body: bytes, base_url: str) -> None:
                 logger.exception("Could not save an external upstream image")
 
 
-async def forward(request: Request, upstream: dict[str, object]):
+async def forward(request: Request, upstream: dict[str, object], request_body: bytes | None = None):
     from api.support import require_identity
 
     try:
@@ -194,12 +194,25 @@ async def forward(request: Request, upstream: dict[str, object]):
             request.method,
             url,
             headers=headers,
-            content=request.stream() if request.method != "GET" else None,
+            content=(request_body if request_body is not None else request.stream()) if request.method != "GET" else None,
         )
         response = await client.send(outbound, stream=True)
     except httpx.RequestError:
         await client.aclose()
         return JSONResponse(status_code=502, content={"error": "External model upstream unavailable"})
+
+    if request.url.path in IMAGE_ENDPOINTS and response.status_code >= 400:
+        try:
+            error_body = await response.aread()
+            error_headers = {
+                name: value
+                for name in ("content-type", "retry-after")
+                if (value := response.headers.get(name))
+            }
+            return Response(content=error_body, status_code=response.status_code, headers=error_headers)
+        finally:
+            await response.aclose()
+            await client.aclose()
 
     content_type = response.headers.get("content-type", "").lower()
     captured = bytearray() if (
@@ -380,6 +393,30 @@ def _replay_body(body: bytes, receive: Receive) -> Receive:
     return replay
 
 
+def _upstream_image_error(response: Response, api_key: str) -> str:
+    body = getattr(response, "body", b"")
+    message = ""
+    if isinstance(body, bytes):
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                message = str(error.get("message") or error.get("detail") or "")
+            elif isinstance(error, str):
+                message = error
+            if not message:
+                message = str(payload.get("detail") or "")
+        if not message:
+            message = body.decode("utf-8", errors="replace").strip()
+    message = " ".join(message.split())[:500] or "no error details returned"
+    if api_key:
+        message = message.replace(api_key, "[redacted]")
+    return f"External image upstream returned HTTP {response.status_code}: {message}"
+
+
 def handle_image_task(payload: dict[str, object], mode: str) -> dict[str, object] | None:
     """Route the web image-task workflow to the external provider when its model is selected."""
     upstream = config.get_external_upstream_settings()
@@ -508,8 +545,9 @@ class ExternalUpstreamMiddleware:
             return
 
         forwarded_request = Request(scope, _replay_body(upstream_body, receive))
-        response = await forward(forwarded_request, upstream)
+        response = await forward(forwarded_request, upstream, upstream_body)
         if image_request and response.status_code >= 400:
+            upstream_error = _upstream_image_error(response, str(upstream.get("api_key") or ""))
             local_model_ids = await _local_model_ids()
             fallback_model = local_image_fallback_model(model, local_model_ids)
             if fallback_model is None:
@@ -531,9 +569,11 @@ class ExternalUpstreamMiddleware:
                 "event": "external_image_request_fallback",
                 "path": path,
                 "upstream_status": response.status_code,
+                "upstream_error": upstream_error,
                 "model": model,
                 "fallback_model": fallback_model,
             })
+            scope.setdefault("state", {})["external_image_upstream_error"] = upstream_error
             await self.app(scope, _replay_body(local_body, receive), send)
             return
         await response(scope, receive, send)
