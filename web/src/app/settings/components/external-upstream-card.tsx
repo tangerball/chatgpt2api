@@ -66,7 +66,7 @@ export function ExternalUpstreamCard() {
               启用外部模型上游
             </label>
             <p className="text-sm leading-6 text-stone-500">
-              本地账号池（包括导入的 Sub2API 账号）会继续提供额度。模型按名称分流；同名模型会额外显示为 upstream/模型名，供你单独使用外部上游额度。
+              本地账号池（包括导入的 Sub2API 账号）会继续提供额度。模型目录不额外显示 upstream/ 前缀选项；图片生成优先走外部上游，失败时再回退到本地支持的图片模型。
             </p>
             <div className="space-y-2">
               <label htmlFor="external-upstream-url" className="text-sm font-medium text-stone-700">服务地址</label>

@@ -394,14 +394,12 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["model"], "local-model")
         self.assertEqual(str(forwarded.url), "http://upstream.example:6679/v1/chat/completions")
 
-    def test_colliding_model_id_selects_local_or_upstream_quota_by_prefix(self):
+    def test_colliding_model_id_is_listed_once_without_upstream_alias(self):
         self.configure()
         self.upstream_content = b'{"object":"list","data":[{"id":"local-model"}]}'
         catalog = self.client.get("/v1/models", headers=LOCAL_AUTH)
         self.assertEqual(catalog.status_code, 200)
-        self.assertEqual({item["id"] for item in catalog.json()["data"]}, {
-            "local-model", "upstream/local-model",
-        })
+        self.assertEqual([item["id"] for item in catalog.json()["data"]], ["local-model"])
         self.requests.clear()
 
         with mock.patch.object(ai.openai_v1_chat_complete, "handle", return_value={"model": "local-model"}):
@@ -571,14 +569,15 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"]["message"], "Model catalogs unavailable")
 
-    def test_model_catalog_keeps_both_sources_when_model_ids_collide(self):
+    def test_model_catalog_merges_unique_upstream_models_without_prefixed_duplicates(self):
         self.configure()
         self.upstream_content = b'{"object":"list","data":[{"id":"local-model"},{"id":"remote-model"}]}'
         response = self.client.get("/v1/models", headers=LOCAL_AUTH)
         self.assertEqual(response.status_code, 200)
         self.assertEqual({item["id"] for item in response.json()["data"]}, {
-            "local-model", "upstream/local-model", "remote-model",
+            "local-model", "remote-model",
         })
+        self.assertFalse(any(item["id"].startswith("upstream/") for item in response.json()["data"]))
 
 
 if __name__ == "__main__":

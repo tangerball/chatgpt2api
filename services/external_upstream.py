@@ -302,8 +302,7 @@ async def _merged_model_response(upstream: dict[str, object]) -> JSONResponse:
         return JSONResponse(status_code=502, content={"error": {"message": "Model catalogs unavailable"}})
     external_items = external_items or {}
     for model_id, item in external_items.items():
-        external_id = f"{UPSTREAM_MODEL_PREFIX}{model_id}" if model_id in merged else model_id
-        merged.setdefault(external_id, {**item, "id": external_id, "root": external_id})
+        merged.setdefault(model_id, {**item, "id": model_id, "root": model_id})
     return JSONResponse(content={"object": "list", "data": [merged[key] for key in sorted(merged)]})
 
 
