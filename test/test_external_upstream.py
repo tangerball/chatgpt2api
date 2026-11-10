@@ -218,18 +218,23 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.upstream_status = 503
         self.upstream_content = b'{"error":{"message":"upstream unavailable"}}'
         local_result = {"data": [{"url": "https://local.example/image.png"}]}
-        with mock.patch.object(ai.openai_v1_image_generations, "handle", return_value=local_result) as local_handler:
+        with (
+            mock.patch.object(external_upstream, "list_local_models", return_value={
+                "object": "list", "data": [{"id": "gpt-image-2"}],
+            }),
+            mock.patch.object(ai.openai_v1_image_generations, "handle", return_value=local_result) as local_handler,
+        ):
             response = self.client.post(
                 "/v1/images/generations",
                 headers=LOCAL_AUTH,
-                json={"model": "local-model", "prompt": "red square", "n": 1},
+                json={"model": "gpt-image-2", "prompt": "red square", "n": 1},
             )
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), local_result)
         self.assertEqual(len(self.requests), 1)
         local_handler.assert_called_once()
-        self.assertEqual(local_handler.call_args.args[0]["model"], "local-model")
+        self.assertEqual(local_handler.call_args.args[0]["model"], "gpt-image-2")
 
     def test_base64_image_is_saved_without_changing_upstream_response(self):
         self.configure()
@@ -295,7 +300,7 @@ class ExternalUpstreamTests(unittest.TestCase):
             "/v1/images/generations", headers=LOCAL_AUTH,
             json={"model": "remote-model", "prompt": "red square"},
         )
-        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.status_code, 429)
         self.assertEqual(self.image_items(), [])
 
     def test_storage_failure_does_not_change_upstream_response(self):
@@ -472,6 +477,30 @@ class ExternalUpstreamTests(unittest.TestCase):
         items = self.image_items()
         self.assertEqual(len(items), 1)
         self.assertEqual(image_storage_service.get_bytes(items[0]["path"]), image)
+
+    def test_v1_image_failure_falls_back_to_a_supported_local_image_model(self):
+        self.configure()
+        self.upstream_status = 503
+        self.upstream_content = b'{"error":{"message":"temporary upstream failure"}}'
+        self.upstream_headers = {"content-type": "application/json"}
+        with (
+            mock.patch.object(external_upstream, "list_local_models", return_value={
+                "object": "list", "data": [{"id": "gpt-image-2"}],
+            }),
+            mock.patch.object(ai.openai_v1_image_generations, "handle", return_value={
+                "data": [{"url": "https://local.test/fallback.png"}],
+            }) as local_handler,
+        ):
+            response = self.client.post("/v1/images/generations", headers=LOCAL_AUTH, json={
+                "model": "gpt-image-2.5-sunburst",
+                "prompt": "red square",
+                "n": 1,
+            })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["data"][0]["url"], "https://local.test/fallback.png")
+        self.assertEqual(json.loads(self.requests[0][1])["model"], "gpt-image-2.5-sunburst")
+        self.assertEqual(local_handler.call_args.args[0]["model"], "gpt-image-2")
 
     def test_image_task_uses_upstream_first_even_when_model_is_available_locally(self):
         self.configure()

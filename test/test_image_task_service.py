@@ -144,7 +144,13 @@ class ImageTaskServiceTests(unittest.TestCase):
                 edit_handler=local_handler,
                 retention_days_getter=lambda: 30,
             )
-            with mock.patch("services.image_task_service.handle_image_task", side_effect=RuntimeError("invalid n field type")):
+            with (
+                mock.patch("services.image_task_service.handle_image_task", side_effect=RuntimeError("invalid n field type")),
+                mock.patch(
+                    "services.image_task_service.openai_v1_models.list_models",
+                    return_value={"data": [{"id": "gpt-image-2"}]},
+                ),
+            ):
                 service.submit_generation(
                     OWNER,
                     client_task_id="fallback-image-task",
@@ -155,6 +161,38 @@ class ImageTaskServiceTests(unittest.TestCase):
                 )
                 task = wait_for_task(service, OWNER, "fallback-image-task", "success")
 
+            self.assertEqual(task["data"], local_result["data"])
+            self.assertEqual(local_handler.call_args.args[0]["model"], "gpt-image-2")
+
+    def test_upstream_only_image_model_falls_back_to_available_local_image_model(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_result = {"data": [{"url": "https://local.test/fallback.png"}]}
+            local_handler = mock.Mock(return_value=local_result)
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=local_handler,
+                edit_handler=local_handler,
+                retention_days_getter=lambda: 30,
+            )
+            upstream_error = RuntimeError("upstream returned HTTP 400: model temporarily unavailable")
+            with (
+                mock.patch("services.image_task_service.handle_image_task", side_effect=upstream_error),
+                mock.patch(
+                    "services.image_task_service.openai_v1_models.list_models",
+                    return_value={"data": [{"id": "gpt-image-2"}]},
+                ),
+            ):
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="upstream-only-image-task",
+                    prompt="cup",
+                    model="gpt-image-2.5-sunburst",
+                    size="1024x1024",
+                    base_url="https://local.test",
+                )
+                task = wait_for_task(service, OWNER, "upstream-only-image-task", "success")
+
+            self.assertEqual(task["status"], "success")
             self.assertEqual(task["data"], local_result["data"])
             self.assertEqual(local_handler.call_args.args[0]["model"], "gpt-image-2")
 

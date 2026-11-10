@@ -18,8 +18,8 @@ from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Receive, Scope, Send
 from PIL import Image
 
-from api.support import require_identity
 from services.config import config
+from services.image_model_routing import local_image_fallback_model
 from services.image_storage_service import image_storage_service
 from services.protocol.openai_v1_models import list_models as list_local_models
 
@@ -32,6 +32,38 @@ UPSTREAM_MODEL_PREFIX = "upstream/"
 MODEL_CATALOG_TTL_SECONDS = 60
 _model_catalog_lock = RLock()
 _model_catalog_cache: dict[str, object] = {"base_url": "", "expires_at": 0.0, "models": {}}
+
+
+def _replace_model_in_body(body: bytes, content_type: str, model: str) -> bytes | None:
+    if "application/json" in content_type.lower():
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload["model"] = model
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+
+    if "multipart/form-data" not in content_type.lower():
+        return None
+    boundary_match = re.search(r"boundary=(?:\"([^\"]+)\"|([^;\s]+))", content_type, re.IGNORECASE)
+    if not boundary_match:
+        return None
+    boundary = (boundary_match.group(1) or boundary_match.group(2)).encode()
+    delimiter = b"--" + boundary
+    parts = body.split(delimiter)
+    for index, part in enumerate(parts):
+        header_end = part.find(b"\r\n\r\n")
+        if header_end < 0 or not re.search(rb'content-disposition:[^\r\n]*\bname="model"', part[:header_end], re.IGNORECASE):
+            continue
+        value_start = header_end + 4
+        value_end = part.find(b"\r\n", value_start)
+        if value_end < 0:
+            return None
+        parts[index] = part[:value_start] + model.encode() + part[value_end:]
+        return delimiter.join(parts)
+    return None
 
 
 MODEL_ENDPOINTS = {
@@ -132,6 +164,8 @@ async def _mirror_images(body: bytes, base_url: str) -> None:
 
 
 async def forward(request: Request, upstream: dict[str, object]):
+    from api.support import require_identity
+
     try:
         require_identity(request.headers.get("authorization"))
     except HTTPException as exc:
@@ -444,6 +478,8 @@ class ExternalUpstreamMiddleware:
             await self.app(scope, receive, send)
             return
         if path == "/v1/models":
+            from api.support import require_identity
+
             request = Request(scope, receive)
             try:
                 require_identity(request.headers.get("authorization"))
@@ -475,6 +511,19 @@ class ExternalUpstreamMiddleware:
         forwarded_request = Request(scope, _replay_body(upstream_body, receive))
         response = await forward(forwarded_request, upstream)
         if image_request and response.status_code >= 400:
+            local_model_ids = await _local_model_ids()
+            fallback_model = local_image_fallback_model(model, local_model_ids)
+            if fallback_model is None:
+                await response(scope, receive, send)
+                return
+            local_body = _replace_model_in_body(
+                upstream_body,
+                request.headers.get("content-type", ""),
+                fallback_model,
+            )
+            if local_body is None:
+                await response(scope, receive, send)
+                return
             body_iterator = getattr(response, "body_iterator", None)
             close_iterator = getattr(body_iterator, "aclose", None)
             if close_iterator is not None:
@@ -483,7 +532,9 @@ class ExternalUpstreamMiddleware:
                 "event": "external_image_request_fallback",
                 "path": path,
                 "upstream_status": response.status_code,
+                "model": model,
+                "fallback_model": fallback_model,
             })
-            await self.app(scope, _replay_body(upstream_body, receive), send)
+            await self.app(scope, _replay_body(local_body, receive), send)
             return
         await response(scope, receive, send)

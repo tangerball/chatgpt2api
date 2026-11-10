@@ -12,8 +12,9 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.external_upstream import handle_image_task
+from services.image_model_routing import local_image_fallback_model
 from services.log_service import LOG_TYPE_CALL, log_service
-from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.protocol import openai_v1_image_edit, openai_v1_image_generations, openai_v1_models
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -261,19 +262,52 @@ class ImageTaskService:
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
+            upstream_error: Exception | None = None
             try:
                 result = handle_image_task(payload, mode)
                 if result is not None and (not isinstance(result, dict) or not isinstance(result.get("data"), list) or not result["data"]):
                     raise RuntimeError("external upstream returned no images")
             except Exception as exc:
-                logger.warning({"event": "external_image_task_fallback", "error_type": type(exc).__name__})
+                upstream_error = exc
+                logger.warning({
+                    "event": "external_image_task_fallback",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:300],
+                })
                 result = None
             if result is None:
                 local_payload = dict(payload_with_progress)
                 model_name = _clean(local_payload.get("model"))
-                if model_name.startswith("upstream/"):
+                if upstream_error is not None:
+                    try:
+                        local_models = openai_v1_models.list_models().get("data", [])
+                        local_model_ids = {
+                            _clean(item.get("id"))
+                            for item in local_models
+                            if isinstance(item, dict)
+                        }
+                    except Exception:
+                        local_model_ids = set()
+                    fallback_model = local_image_fallback_model(model_name, local_model_ids)
+                    if fallback_model is None:
+                        raise upstream_error
+                    local_payload["model"] = fallback_model
+                    logger.warning({
+                        "event": "external_image_task_fallback_selected",
+                        "requested_model": model_name,
+                        "fallback_model": fallback_model,
+                    })
+                elif model_name.startswith("upstream/"):
                     local_payload["model"] = model_name.removeprefix("upstream/")
-                result = handler(local_payload)
+                try:
+                    result = handler(local_payload)
+                except Exception as local_error:
+                    if upstream_error is None:
+                        raise
+                    raise RuntimeError(
+                        f"External image model failed: {upstream_error}; "
+                        f"local fallback {local_payload.get('model')} failed: {local_error}"
+                    ) from local_error
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
