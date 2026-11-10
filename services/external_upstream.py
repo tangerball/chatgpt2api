@@ -6,6 +6,9 @@ import binascii
 import io
 import json
 import logging
+import re
+import time
+from threading import RLock
 from urllib.parse import urlsplit
 
 import httpx
@@ -18,12 +21,17 @@ from PIL import Image
 from api.support import require_identity
 from services.config import config
 from services.image_storage_service import image_storage_service
+from services.protocol.openai_v1_models import list_models as list_local_models
 
 
 logger = logging.getLogger(__name__)
 IMAGE_ENDPOINTS = {"/v1/images/generations", "/v1/images/edits"}
 MAX_MIRROR_RESPONSE_BYTES = 128 * 1024 * 1024
 MAX_MIRROR_IMAGE_BYTES = 64 * 1024 * 1024
+UPSTREAM_MODEL_PREFIX = "upstream/"
+MODEL_CATALOG_TTL_SECONDS = 60
+_model_catalog_lock = RLock()
+_model_catalog_cache: dict[str, object] = {"base_url": "", "expires_at": 0.0, "models": {}}
 
 
 MODEL_ENDPOINTS = {
@@ -206,6 +214,236 @@ async def forward(request: Request, upstream: dict[str, object]):
     )
 
 
+async def _fetch_upstream_models(upstream: dict[str, object]) -> dict[str, dict[str, object]] | None:
+    """读取上游模型目录；上游不可用时返回 None，让本地账号池目录继续工作。"""
+    base_url = str(upstream["base_url"])
+    now = time.monotonic()
+    with _model_catalog_lock:
+        cached = _model_catalog_cache["models"]
+        if _model_catalog_cache["base_url"] == base_url and now < float(_model_catalog_cache["expires_at"]):
+            return dict(cached) if isinstance(cached, dict) else None
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=20, write=10, pool=10),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            response = await client.get(
+                base_url + "/v1/models",
+                headers={"Authorization": f"Bearer {upstream['api_key']}", "Accept-Encoding": "identity"},
+            )
+        payload = response.json()
+        if response.is_error or not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError("upstream model catalog response is invalid")
+        models = {
+            str(item["id"]).strip(): dict(item)
+            for item in payload["data"]
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+    except (httpx.RequestError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning({"event": "external_model_catalog_failed", "error_type": type(exc).__name__})
+        with _model_catalog_lock:
+            cached = _model_catalog_cache["models"]
+            return dict(cached) if _model_catalog_cache["base_url"] == base_url and isinstance(cached, dict) else None
+    with _model_catalog_lock:
+        _model_catalog_cache.update({"base_url": base_url, "expires_at": time.monotonic() + MODEL_CATALOG_TTL_SECONDS, "models": models})
+    return models
+
+
+async def _merged_model_response(upstream: dict[str, object]) -> JSONResponse:
+    """合并本地号池与外部上游模型；重名模型使用前缀显式选择外部额度。"""
+    local_failed = False
+    try:
+        local_payload = await asyncio.to_thread(list_local_models)
+    except Exception as exc:  # noqa: BLE001 - the regular local endpoint owns its normal error response
+        logger.warning({"event": "local_model_catalog_failed", "error_type": type(exc).__name__})
+        local_failed = True
+        local_payload = {}
+    local_items = local_payload.get("data", []) if isinstance(local_payload, dict) else []
+    if not isinstance(local_items, list):
+        local_items = []
+    merged = {str(item.get("id")): dict(item) for item in local_items if isinstance(item, dict) and item.get("id")}
+    external_items = await _fetch_upstream_models(upstream)
+    if local_failed and external_items is None:
+        return JSONResponse(status_code=502, content={"error": {"message": "Model catalogs unavailable"}})
+    external_items = external_items or {}
+    for model_id, item in external_items.items():
+        external_id = f"{UPSTREAM_MODEL_PREFIX}{model_id}" if model_id in merged else model_id
+        merged.setdefault(external_id, {**item, "id": external_id, "root": external_id})
+    return JSONResponse(content={"object": "list", "data": [merged[key] for key in sorted(merged)]})
+
+
+def _model_from_request(path: str, body: bytes, content_type: str) -> tuple[str, bytes, bool]:
+    """提取 JSON 或 multipart 中的模型名，并仅在选择上游别名时剥离路由前缀。"""
+    model = ""
+    explicit_upstream = False
+    if "application/json" in content_type.lower():
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            model = str(payload.get("model") or "")
+            if model.startswith(UPSTREAM_MODEL_PREFIX):
+                explicit_upstream = True
+                model = model[len(UPSTREAM_MODEL_PREFIX):]
+                payload["model"] = model
+                body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    elif "multipart/form-data" in content_type.lower():
+        boundary_match = re.search(r"boundary=(?:\"([^\"]+)\"|([^;\s]+))", content_type, re.IGNORECASE)
+        if boundary_match:
+            boundary = (boundary_match.group(1) or boundary_match.group(2)).encode()
+            delimiter = b"--" + boundary
+            parts = body.split(delimiter)
+            for index, part in enumerate(parts):
+                header_end = part.find(b"\r\n\r\n")
+                if header_end < 0 or not re.search(rb'content-disposition:[^\r\n]*\bname="model"', part[:header_end], re.IGNORECASE):
+                    continue
+                value_start = header_end + 4
+                value_end = part.find(b"\r\n", value_start)
+                if value_end < 0:
+                    break
+                try:
+                    model = part[value_start:value_end].decode().strip()
+                except UnicodeDecodeError:
+                    break
+                if model.startswith(UPSTREAM_MODEL_PREFIX):
+                    explicit_upstream = True
+                    model = model[len(UPSTREAM_MODEL_PREFIX):]
+                    parts[index] = part[:value_start] + model.encode() + part[value_end:]
+                    body = delimiter.join(parts)
+                break
+    if not model and path == "/v1/images/generations":
+        model = "gpt-image-2"
+    return model, body, explicit_upstream
+
+
+async def _local_model_ids() -> set[str]:
+    """读取本地账号池实际支持的模型名；目录故障不阻断对已配置上游的显式请求。"""
+    try:
+        payload = await asyncio.to_thread(list_local_models)
+    except Exception as exc:  # noqa: BLE001 - preserve direct upstream access when the local catalog is down
+        logger.warning({"event": "local_model_catalog_failed", "error_type": type(exc).__name__})
+        return set()
+    items = payload.get("data", []) if isinstance(payload, dict) else []
+    return {
+        str(item.get("id")).strip()
+        for item in items
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    } if isinstance(items, list) else set()
+
+
+def _replay_body(body: bytes, receive: Receive) -> Receive:
+    """重放已检查的请求体，避免模型路由检查吞掉本地或远端处理所需的数据。"""
+    sent = False
+
+    async def replay() -> dict[str, object]:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return replay
+
+
+def handle_image_task(payload: dict[str, object], mode: str) -> dict[str, object] | None:
+    """Route the web image-task workflow to the external provider when its model is selected."""
+    upstream = config.get_external_upstream_settings()
+    if not upstream["enabled"]:
+        return None
+
+    requested_model = str(payload.get("model") or "gpt-image-2")
+    explicit_upstream = requested_model.startswith(UPSTREAM_MODEL_PREFIX)
+    model = requested_model[len(UPSTREAM_MODEL_PREFIX):] if explicit_upstream else requested_model
+    try:
+        local_catalog = list_local_models()
+        local_items = local_catalog.get("data", []) if isinstance(local_catalog, dict) else []
+        local_models = {
+            str(item.get("id") or "").strip()
+            for item in local_items
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        } if isinstance(local_items, list) else set()
+    except Exception as exc:  # noqa: BLE001 - an explicit external selection remains usable without local discovery
+        logger.warning({"event": "local_model_catalog_failed", "error_type": type(exc).__name__})
+        local_models = set()
+
+    if not explicit_upstream and model in local_models:
+        return None
+
+    base_url = str(upstream["base_url"])
+    api_key = str(upstream["api_key"])
+    endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
+    fields: dict[str, str] = {
+        "prompt": str(payload.get("prompt") or ""),
+        "model": model,
+        "n": str(payload.get("n") or 1),
+        "quality": str(payload.get("quality") or "auto"),
+        "response_format": "b64_json",
+    }
+    if payload.get("size"):
+        fields["size"] = str(payload["size"])
+
+    headers = {"Authorization": f"Bearer {api_key}", "Accept-Encoding": "identity"}
+    timeout = httpx.Timeout(connect=15, read=600, write=600, pool=15)
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+            if mode == "edit":
+                from services.protocol.openai_v1_image_edit import _composite_mask
+
+                images = payload.get("images") if isinstance(payload.get("images"), list) else []
+                masks = payload.get("mask") if isinstance(payload.get("mask"), list) else []
+                images = _composite_mask(images, masks)
+                files = [
+                    ("image", (str(filename), image_data, str(mime_type)))
+                    for image_data, filename, mime_type in images
+                ]
+                if not files:
+                    raise RuntimeError("image is required")
+                response = client.post(
+                    base_url + endpoint,
+                    headers=headers,
+                    data=fields,
+                    files=files,
+                )
+            else:
+                response = client.post(
+                    base_url + endpoint,
+                    headers={**headers, "Content-Type": "application/json"},
+                    json=fields,
+                )
+    except httpx.RequestError as exc:
+        logger.warning({"event": "external_image_task_failed", "error_type": type(exc).__name__})
+        raise RuntimeError("External model upstream unavailable") from exc
+
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"External model upstream returned HTTP {response.status_code} with invalid JSON") from exc
+    if response.is_error:
+        error = result.get("error") if isinstance(result, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        raise RuntimeError(str(message or f"External model upstream returned HTTP {response.status_code}"))
+    if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+        raise RuntimeError("External model upstream returned an invalid image response")
+
+    # Persist external outputs in the local image library and keep task history compact.
+    for item in result["data"]:
+        if not isinstance(item, dict):
+            continue
+        image_data = _decode_image(item.get("b64_json"))
+        if image_data is None:
+            continue
+        try:
+            stored = image_storage_service.save(image_data, str(payload.get("base_url") or "") or None)
+            item["url"] = stored.url
+            item.pop("b64_json", None)
+        except Exception:
+            logger.exception("Could not save an external upstream image task result")
+
+    return {"data": result["data"], "usage": result.get("usage")}
+
+
 class ExternalUpstreamMiddleware:
     def __init__(self, app: ASGIApp):
         self.app = app
@@ -220,6 +458,34 @@ class ExternalUpstreamMiddleware:
         if not upstream["enabled"] or MODEL_ENDPOINTS.get(path) != method:
             await self.app(scope, receive, send)
             return
+        if path == "/v1/models":
+            request = Request(scope, receive)
+            try:
+                require_identity(request.headers.get("authorization"))
+            except HTTPException as exc:
+                response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            else:
+                response = await _merged_model_response(upstream)
+            await response(scope, receive, send)
+            return
+
         request = Request(scope, receive)
-        response = await forward(request, upstream)
+        body = await request.body() if method not in {"GET", "HEAD"} else b""
+        model, upstream_body, explicit_upstream = _model_from_request(
+            path,
+            body,
+            request.headers.get("content-type", ""),
+        )
+        if path == "/v1/search" or explicit_upstream:
+            use_external = True
+        else:
+            local_models = await _local_model_ids()
+            use_external = bool(model) and model not in local_models
+
+        if not use_external:
+            await self.app(scope, _replay_body(body, receive), send)
+            return
+
+        forwarded_request = Request(scope, _replay_body(upstream_body, receive))
+        response = await forward(forwarded_request, upstream)
         await response(scope, receive, send)

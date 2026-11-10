@@ -98,6 +98,9 @@ def _normalize_external_upstream_settings(value: object, previous: object = None
     enabled = _normalize_bool(source.get("enabled"), False)
     if base_url:
         parsed = urlsplit(base_url)
+        if parsed.path.rstrip("/").lower() == "/v1":
+            base_url = parsed._replace(path="").geturl()
+            parsed = urlsplit(base_url)
         try:
             port_valid = parsed.port is None or 1 <= parsed.port <= 65535
         except ValueError:

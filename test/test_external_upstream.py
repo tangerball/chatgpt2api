@@ -34,6 +34,12 @@ class ExternalUpstreamTests(unittest.TestCase):
         original_data = config.data
         config.data = copy.deepcopy(original_data)
         self.addCleanup(setattr, config, "data", original_data)
+        external_upstream._model_catalog_cache.update({"base_url": "", "expires_at": 0.0, "models": {}})
+        local_models_patcher = mock.patch.object(external_upstream, "list_local_models", return_value={
+            "object": "list", "data": [{"id": "local-model"}],
+        })
+        local_models_patcher.start()
+        self.addCleanup(local_models_patcher.stop)
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         file_patcher = mock.patch("services.config.EXTERNAL_UPSTREAM_FILE", Path(temporary.name) / "external_upstream.json")
@@ -111,6 +117,10 @@ class ExternalUpstreamTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
 
+    @staticmethod
+    def expire_external_catalog():
+        external_upstream._model_catalog_cache["expires_at"] = 0.0
+
     def test_settings_require_admin_and_never_return_key(self):
         self.assertEqual(self.client.get("/api/external-upstream").status_code, 401)
         self.configure()
@@ -147,12 +157,30 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
         response = self.client.get("/v1/models", headers={**LOCAL_AUTH, "Cookie": "session=secret"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["data"][0]["id"], "remote-model")
+        self.assertEqual({item["id"] for item in response.json()["data"]}, {"local-model", "remote-model"})
         forwarded, _ = self.requests[0]
         self.assertEqual(str(forwarded.url), "http://upstream.example:6679/v1/models")
         self.assertEqual(forwarded.headers["authorization"], f"Bearer {REMOTE_KEY}")
         self.assertNotIn("cookie", forwarded.headers)
         self.assertNotIn(LOCAL_KEY, str(forwarded.headers))
+
+    def test_daixu_root_and_v1_base_urls_route_to_openai_v1_once(self):
+        for base_url in ("https://daixu.qzz.io/", "https://daixu.qzz.io/v1"):
+            with self.subTest(base_url=base_url):
+                response = self.client.post(
+                    "/api/external-upstream",
+                    headers=LOCAL_AUTH,
+                    json={"enabled": True, "base_url": base_url, "api_key": REMOTE_KEY},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["upstream"]["base_url"], "https://daixu.qzz.io")
+
+                self.requests.clear()
+                self.expire_external_catalog()
+                response = self.client.get("/v1/models", headers=LOCAL_AUTH)
+                self.assertEqual(response.status_code, 200, response.text)
+                forwarded, _ = self.requests[0]
+                self.assertEqual(str(forwarded.url), "https://daixu.qzz.io/v1/models")
 
     def test_multipart_upload_is_forwarded_without_reencoding(self):
         self.configure()
@@ -266,15 +294,26 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.upstream_status = 429
         self.upstream_headers = {"content-type": "application/json", "retry-after": "10"}
         self.upstream_content = b'{"error":{"message":"rate limited"}}'
-        response = self.client.get("/v1/models", headers=LOCAL_AUTH)
+        response = self.client.post("/v1/chat/completions", headers=LOCAL_AUTH, json={
+            "model": "remote-model", "messages": [{"role": "user", "content": "hello"}],
+        })
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.headers["retry-after"], "10")
         self.assertEqual(response.content, self.upstream_content)
+        self.expire_external_catalog()
+        response = self.client.get("/v1/models", headers=LOCAL_AUTH)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("local-model", {item["id"] for item in response.json()["data"]})
 
     def test_unavailable_upstream_and_cors_preflight(self):
         self.configure()
         self.upstream_error = True
         response = self.client.get("/v1/models", headers=LOCAL_AUTH)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.json()["data"]], ["local-model"])
+        response = self.client.post("/v1/chat/completions", headers=LOCAL_AUTH, json={
+            "model": "remote-model", "messages": [{"role": "user", "content": "hello"}],
+        })
         self.assertEqual(response.status_code, 502)
         self.assertNotIn(REMOTE_KEY, response.text)
         preflight = self.client.options("/v1/models", headers={
@@ -293,6 +332,179 @@ class ExternalUpstreamTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"][0]["id"], "local-model")
         self.assertEqual(self.requests, [])
+
+    def test_local_imported_model_stays_routed_locally_while_upstream_is_enabled(self):
+        self.configure()
+        with mock.patch.object(ai.openai_v1_chat_complete, "handle", return_value={"model": "local-model", "choices": []}):
+            response = self.client.post("/v1/chat/completions", headers=LOCAL_AUTH, json={
+                "model": "local-model", "messages": [{"role": "user", "content": "hello"}],
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["model"], "local-model")
+        self.assertEqual(self.requests, [])
+
+    def test_upstream_model_alias_routes_remotely_and_strips_alias(self):
+        self.configure()
+        self.upstream_content = b'{"id":"ok","model":"local-model"}'
+        response = self.client.post("/v1/chat/completions", headers=LOCAL_AUTH, json={
+            "model": "upstream/local-model", "messages": [{"role": "user", "content": "hello"}],
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.requests), 1)
+        forwarded, body = self.requests[0]
+        self.assertEqual(json.loads(body)["model"], "local-model")
+        self.assertEqual(str(forwarded.url), "http://upstream.example:6679/v1/chat/completions")
+
+    def test_colliding_model_id_selects_local_or_upstream_quota_by_prefix(self):
+        self.configure()
+        self.upstream_content = b'{"object":"list","data":[{"id":"local-model"}]}'
+        catalog = self.client.get("/v1/models", headers=LOCAL_AUTH)
+        self.assertEqual(catalog.status_code, 200)
+        self.assertEqual({item["id"] for item in catalog.json()["data"]}, {
+            "local-model", "upstream/local-model",
+        })
+        self.requests.clear()
+
+        with mock.patch.object(ai.openai_v1_chat_complete, "handle", return_value={"model": "local-model"}):
+            local_response = self.client.post("/v1/chat/completions", headers=LOCAL_AUTH, json={
+                "model": "local-model", "messages": [{"role": "user", "content": "local"}],
+            })
+        self.assertEqual(local_response.status_code, 200, local_response.text)
+        self.assertEqual(self.requests, [])
+
+        upstream_response = self.client.post("/v1/chat/completions", headers=LOCAL_AUTH, json={
+            "model": "upstream/local-model", "messages": [{"role": "user", "content": "remote"}],
+        })
+        self.assertEqual(upstream_response.status_code, 200, upstream_response.text)
+        self.assertEqual(len(self.requests), 1)
+        _, body = self.requests[0]
+        self.assertEqual(json.loads(body)["model"], "local-model")
+
+    def test_multipart_upstream_alias_is_stripped_without_changing_file_parts(self):
+        self.configure()
+        response = self.client.post(
+            "/v1/images/edits",
+            headers=LOCAL_AUTH,
+            data={"prompt": "edit", "model": "upstream/remote-model"},
+            files={"image": ("source.png", b"image-bytes", "image/png")},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        forwarded, body = self.requests[0]
+        self.assertIn("multipart/form-data", forwarded.headers["content-type"])
+        self.assertIn(b'name="model"\r\n\r\nremote-model', body)
+        self.assertNotIn(b"upstream/remote-model", body)
+        self.assertIn(b"image-bytes", body)
+        self.assertIn(b"source.png", body)
+
+    def test_image_task_external_model_uses_provider_and_saves_local_image(self):
+        self.configure()
+        image = self.image_bytes()
+        sync_requests: list[tuple[httpx.Request, bytes]] = []
+
+        def handle_sync(request: httpx.Request) -> httpx.Response:
+            sync_requests.append((request, request.read()))
+            return httpx.Response(200, json={"data": [{
+                "b64_json": base64.b64encode(image).decode(),
+                "revised_prompt": "a red square",
+            }]})
+
+        real_client = httpx.Client
+        transport = httpx.MockTransport(handle_sync)
+        with mock.patch.object(
+            external_upstream.httpx,
+            "Client",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ):
+            result = external_upstream.handle_image_task({
+                "model": "gpt-image-2.5-sunburst",
+                "prompt": "red square",
+                "size": "1024x1024",
+                "base_url": "https://canvas.example",
+            }, "generate")
+
+        self.assertEqual(len(sync_requests), 1)
+        request, body = sync_requests[0]
+        self.assertEqual(str(request.url), "http://upstream.example:6679/v1/images/generations")
+        self.assertEqual(request.headers["authorization"], f"Bearer {REMOTE_KEY}")
+        request_payload = json.loads(body)
+        self.assertEqual(request_payload["model"], "gpt-image-2.5-sunburst")
+        self.assertEqual(request_payload["response_format"], "b64_json")
+        self.assertIsNotNone(result)
+        self.assertNotIn("b64_json", result["data"][0])
+        self.assertEqual(result["data"][0]["url"].split("/images/")[0], "https://canvas.example")
+        items = self.image_items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(image_storage_service.get_bytes(items[0]["path"]), image)
+
+    def test_image_task_local_model_stays_on_local_handler(self):
+        self.configure()
+        result = external_upstream.handle_image_task({"model": "local-model", "prompt": "local"}, "generate")
+        self.assertIsNone(result)
+
+    def test_image_task_edit_forwards_multipart_to_external_provider(self):
+        self.configure()
+        sync_requests: list[tuple[httpx.Request, bytes]] = []
+
+        def handle_sync(request: httpx.Request) -> httpx.Response:
+            sync_requests.append((request, request.read()))
+            return httpx.Response(200, json={"data": [{"url": "https://upstream.example/image.png"}]})
+
+        real_client = httpx.Client
+        transport = httpx.MockTransport(handle_sync)
+        with mock.patch.object(
+            external_upstream.httpx,
+            "Client",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ):
+            result = external_upstream.handle_image_task({
+                "model": "upstream/remote-model",
+                "prompt": "edit",
+                "images": [(b"input-image", "source.png", "image/png")],
+            }, "edit")
+
+        request, body = sync_requests[0]
+        self.assertEqual(str(request.url), "http://upstream.example:6679/v1/images/edits")
+        self.assertIn(b'name="model"\r\n\r\nremote-model', body)
+        self.assertIn(b"source.png", body)
+        self.assertIn(b"input-image", body)
+        self.assertEqual(result["data"][0]["url"], "https://upstream.example/image.png")
+
+    def test_upstream_catalog_failure_still_lists_local_imported_models(self):
+        self.configure()
+        self.upstream_error = True
+        response = self.client.get("/v1/models", headers=LOCAL_AUTH)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item["id"] for item in response.json()["data"]], ["local-model"])
+        with mock.patch.object(ai.openai_v1_chat_complete, "handle", return_value={"model": "local-model", "choices": []}):
+            response = self.client.post("/v1/chat/completions", headers=LOCAL_AUTH, json={
+                "model": "local-model", "messages": [{"role": "user", "content": "still local"}],
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_local_catalog_failure_still_lists_external_models(self):
+        self.configure()
+        self.upstream_content = b'{"object":"list","data":[{"id":"remote-model"}]}'
+        with mock.patch.object(external_upstream, "list_local_models", side_effect=RuntimeError("local catalog unavailable")):
+            response = self.client.get("/v1/models", headers=LOCAL_AUTH)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([item["id"] for item in response.json()["data"]], ["remote-model"])
+
+    def test_all_model_catalogs_unavailable_returns_gateway_error(self):
+        self.configure()
+        self.upstream_error = True
+        with mock.patch.object(external_upstream, "list_local_models", side_effect=RuntimeError("local catalog unavailable")):
+            response = self.client.get("/v1/models", headers=LOCAL_AUTH)
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["message"], "Model catalogs unavailable")
+
+    def test_model_catalog_keeps_both_sources_when_model_ids_collide(self):
+        self.configure()
+        self.upstream_content = b'{"object":"list","data":[{"id":"local-model"},{"id":"remote-model"}]}'
+        response = self.client.get("/v1/models", headers=LOCAL_AUTH)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({item["id"] for item in response.json()["data"]}, {
+            "local-model", "upstream/local-model", "remote-model",
+        })
 
 
 if __name__ == "__main__":

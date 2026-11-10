@@ -63,7 +63,7 @@ docker compose up -d
 
 ### 外部模型上游
 
-管理员可在「设置 → 模型上游」填写另一个 OpenAI 兼容服务的根地址和 API Key，并开启转发。保存后立即生效；关闭后继续使用本地账号池。调用者仍需使用本机 ChatGPT2API 的密钥，服务端校验后才会向上游发送请求，上游 Key 不会返回给浏览器。
+管理员可在「设置 → 模型上游」填写另一个 OpenAI 兼容服务的根地址或以 `/v1` 结尾的地址（例如 `https://daixu.qzz.io` 或 `https://daixu.qzz.io/v1`）和 API Key，并开启混合路由。启用后本地账号池（包括导入的 Sub2API / CPA 账号）仍可使用：本地模型请求继续消耗本地账号额度，外部独有模型按上游目录路由；模型 ID 重名时，本地模型保留原名称，外部模型以 `upstream/<模型名>` 单独列出。OpenAI 兼容接口与 `/image/` 页面后台任务都按所选模型路由。任一模型目录暂时不可用时，另一侧可用模型仍会返回。调用者仍需使用本机 ChatGPT2API 的密钥，服务端校验后才会向上游发送请求，上游 Key 不会返回给浏览器。
 
 转发范围为 `/v1/models`、`/v1/images/generations`、`/v1/images/edits`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 和 `/v1/search`。管理接口、内置画图任务和账号池保持本机处理。上游 Key 保存在 `data/external_upstream.json`，不应将该文件提交到 Git。
 
