@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from services.image_task_service import ImageTaskService
 
@@ -106,6 +107,32 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(result["missing_ids"], [])
             self.assertEqual(result["items"][0]["status"], "success")
             self.assertEqual(result["items"][0]["data"][0]["url"], "http://example.test/image.png")
+
+    def test_external_image_model_uses_external_handler_before_local_pool(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_handler = mock.Mock(side_effect=AssertionError("local pool must not be called"))
+            external_result = {"data": [{"url": "https://local.test/images/generated.png"}]}
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=local_handler,
+                edit_handler=local_handler,
+                retention_days_getter=lambda: 30,
+            )
+            with mock.patch("services.image_task_service.handle_image_task", return_value=external_result) as external_handler:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="external-image-task",
+                    prompt="cup",
+                    model="gpt-image-2.5-sunburst",
+                    size="1024x1024",
+                    base_url="https://local.test",
+                )
+                task = wait_for_task(service, OWNER, "external-image-task", "success")
+
+            self.assertEqual(task["data"], external_result["data"])
+            local_handler.assert_not_called()
+            external_handler.assert_called_once()
+            self.assertEqual(external_handler.call_args.args[1], "generate")
 
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

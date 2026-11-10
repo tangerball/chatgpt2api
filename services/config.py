@@ -5,14 +5,17 @@ from dataclasses import dataclass
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 import time
+from urllib.parse import urlsplit
 
 from services.storage.base import StorageBackend
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
+EXTERNAL_UPSTREAM_FILE = DATA_DIR / "external_upstream.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
@@ -81,6 +84,41 @@ DEFAULT_THIRD_PARTY_APPS = {
         "url": "https://canvas.best",
     },
 }
+
+DEFAULT_EXTERNAL_UPSTREAM = {"enabled": False, "base_url": "", "api_key": ""}
+
+
+def _normalize_external_upstream_settings(value: object, previous: object = None) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    old = previous if isinstance(previous, dict) else {}
+    base_url = str(source.get("base_url") or "").strip().rstrip("/")
+    api_key = str(source.get("api_key") or "").strip() or str(old.get("api_key") or "").strip()
+    if source.get("clear_api_key"):
+        api_key = ""
+    enabled = _normalize_bool(source.get("enabled"), False)
+    if base_url:
+        parsed = urlsplit(base_url)
+        if parsed.path.rstrip("/").lower() == "/v1":
+            base_url = parsed._replace(path="").geturl()
+            parsed = urlsplit(base_url)
+        try:
+            port_valid = parsed.port is None or 1 <= parsed.port <= 65535
+        except ValueError:
+            port_valid = False
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or not port_valid
+            or parsed.username
+            or parsed.password
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("模型上游地址必须是 HTTP(S) 服务根地址")
+    if enabled and (not base_url or not api_key):
+        raise ValueError("启用模型上游前须填写地址和 API Key")
+    return {"enabled": enabled, "base_url": base_url, "api_key": api_key}
 
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
@@ -562,6 +600,7 @@ class ConfigStore:
 
     def get(self) -> dict[str, object]:
         data = dict(self.data)
+        data.pop("external_upstream", None)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
@@ -608,6 +647,34 @@ class ConfigStore:
 
     def get_third_party_apps_settings(self) -> dict[str, object]:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
+
+    def get_external_upstream_settings(self) -> dict[str, object]:
+        return {
+            **DEFAULT_EXTERNAL_UPSTREAM,
+            **_read_json_object(EXTERNAL_UPSTREAM_FILE, name="external_upstream.json"),
+        }
+
+    def get_public_external_upstream_settings(self) -> dict[str, object]:
+        settings = self.get_external_upstream_settings()
+        return {
+            "enabled": settings["enabled"],
+            "base_url": settings["base_url"],
+            "has_api_key": bool(settings["api_key"]),
+        }
+
+    def update_external_upstream_settings(self, value: dict[str, object]) -> dict[str, object]:
+        settings = _normalize_external_upstream_settings(value, self.get_external_upstream_settings())
+        EXTERNAL_UPSTREAM_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(prefix=".external-upstream-", dir=EXTERNAL_UPSTREAM_FILE.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(settings, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+            os.replace(temporary_path, EXTERNAL_UPSTREAM_FILE)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        return self.get_public_external_upstream_settings()
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)

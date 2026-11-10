@@ -10,6 +10,7 @@ from typing import Any
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
+from services.external_upstream import handle_image_task
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
@@ -258,7 +259,9 @@ class ImageTaskService:
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
-            result = handler(payload_with_progress)
+            result = handle_image_task(payload, mode)
+            if result is None:
+                result = handler(payload_with_progress)
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")

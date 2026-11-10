@@ -151,6 +151,19 @@ export type ThirdPartyAppsSettings = {
   };
 };
 
+export type ExternalUpstreamSettings = {
+  enabled: boolean;
+  base_url: string;
+  has_api_key: boolean;
+};
+
+export type ExternalUpstreamUpdate = {
+  enabled: boolean;
+  base_url: string;
+  api_key: string;
+  clear_api_key?: boolean;
+};
+
 export type SettingsConfig = {
   proxy: string;
   base_url?: string;
@@ -518,6 +531,17 @@ export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
 
 export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
+}
+
+export async function fetchExternalUpstream() {
+  return httpRequest<{ upstream: ExternalUpstreamSettings }>("/api/external-upstream");
+}
+
+export async function updateExternalUpstream(settings: ExternalUpstreamUpdate) {
+  return httpRequest<{ upstream: ExternalUpstreamSettings }>("/api/external-upstream", {
+    method: "POST",
+    body: settings,
+  });
 }
 
 export async function updateSettingsConfig(settings: SettingsConfig) {
