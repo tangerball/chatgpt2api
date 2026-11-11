@@ -190,6 +190,13 @@ class ImageCompatibilityTests(unittest.TestCase):
             upstream.handle_image_task(INPUT, "generate")
         self.assertEqual(len(self.image_requests()), 2)
 
+    def test_image_task_retries_transient_upstream_connection(self):
+        self.transient_error_once = True
+        self.first_status, self.first_body = 200, SUCCESS
+        result = upstream.handle_image_task(INPUT, "generate")
+        self.assertEqual(result["data"], SUCCESS["data"])
+        self.assertEqual(len(self.image_requests()), 2)
+
     def test_middleware_retries_transient_upstream_connection_for_image_edit(self):
         self.transient_error_once = True
         self.first_status, self.first_body = 200, SUCCESS

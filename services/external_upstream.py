@@ -555,14 +555,27 @@ def handle_image_task(payload: dict[str, object], mode: str) -> dict[str, object
             # Retry only an explicit parameter rejection, never a successful or
             # ambiguous request (which could generate and bill another image).
             for attempt in range(2):
-                if mode == "edit":
-                    response = client.post(base_url + endpoint, headers=headers, data=fields, files=files)
-                else:
-                    response = client.post(
-                        base_url + endpoint,
-                        headers={**headers, "Content-Type": "application/json"},
-                        json=fields,
-                    )
+                for connection_attempt in range(IMAGE_UPSTREAM_RETRIES + 1):
+                    try:
+                        if mode == "edit":
+                            response = client.post(base_url + endpoint, headers=headers, data=fields, files=files)
+                        else:
+                            response = client.post(
+                                base_url + endpoint,
+                                headers={**headers, "Content-Type": "application/json"},
+                                json=fields,
+                            )
+                        break
+                    except httpx.RequestError:
+                        if connection_attempt >= IMAGE_UPSTREAM_RETRIES:
+                            raise
+                        logger.warning({
+                            "event": "external_image_upstream_retry",
+                            "path": endpoint,
+                            "attempt": connection_attempt + 1,
+                            "max_retries": IMAGE_UPSTREAM_RETRIES,
+                        })
+                        time.sleep(IMAGE_UPSTREAM_RETRY_DELAY_SECONDS * (connection_attempt + 1))
                 if attempt or not _image_complexity_rejected(response.status_code, response.content, model):
                     break
                 retry_model = _sync_complexity_retry_model(client, base_url, headers)
