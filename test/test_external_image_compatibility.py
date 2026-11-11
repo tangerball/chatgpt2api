@@ -32,11 +32,15 @@ class ImageCompatibilityTests(unittest.TestCase):
         self.retry_status = 200
         self.retry_body = SUCCESS
         self.local_calls = 0
+        self.transient_error_once = False
         upstream._model_catalog_cache.update({"base_url": "", "expires_at": 0.0, "models": {}})
 
         def handle(request):
             body = request.read()
             self.requests.append((request, body))
+            if self.transient_error_once and request.url.path in upstream.IMAGE_ENDPOINTS:
+                self.transient_error_once = False
+                raise httpx.ConnectError("connection reset", request=request)
             if request.url.path == "/v1/models":
                 return httpx.Response(self.catalog_status, json={"data": [{"id": x} for x in self.catalog]})
             image_calls = [r for r, _ in self.requests if r.url.path in upstream.IMAGE_ENDPOINTS]
@@ -185,6 +189,18 @@ class ImageCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Complexity"):
             upstream.handle_image_task(INPUT, "generate")
         self.assertEqual(len(self.image_requests()), 2)
+
+    def test_middleware_retries_transient_upstream_connection_for_image_edit(self):
+        self.transient_error_once = True
+        self.first_status, self.first_body = 200, SUCCESS
+        response = self.client.post(
+            "/v1/images/edits",
+            data={"model": "gpt-image-2", "prompt": "edit"},
+            files={"image": ("source.png", b"image-bytes", "image/png")},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.image_requests()), 2)
+        self.assertEqual(self.local_calls, 0)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ from services.protocol.openai_v1_models import list_models as list_local_models
 
 logger = logging.getLogger(__name__)
 IMAGE_ENDPOINTS = {"/v1/images/generations", "/v1/images/edits"}
+IMAGE_UPSTREAM_RETRIES = 2
+IMAGE_UPSTREAM_RETRY_DELAY_SECONDS = 0.25
 MAX_MIRROR_RESPONSE_BYTES = 128 * 1024 * 1024
 MAX_MIRROR_IMAGE_BYTES = 64 * 1024 * 1024
 UPSTREAM_MODEL_PREFIX = "upstream/"
@@ -215,13 +217,28 @@ async def forward(request: Request, upstream: dict[str, object], request_body: b
         trust_env=False,
     )
     try:
-        outbound = client.build_request(
-            request.method,
-            url,
-            headers=headers,
-            content=(request_body if request_body is not None else request.stream()) if request.method != "GET" else None,
-        )
-        response = await client.send(outbound, stream=True)
+        response = None
+        for attempt in range(IMAGE_UPSTREAM_RETRIES + 1):
+            outbound = client.build_request(
+                request.method,
+                url,
+                headers=headers,
+                content=(request_body if request_body is not None else request.stream()) if request.method != "GET" else None,
+            )
+            try:
+                response = await client.send(outbound, stream=True)
+                break
+            except httpx.RequestError:
+                if request.url.path not in IMAGE_ENDPOINTS or attempt >= IMAGE_UPSTREAM_RETRIES:
+                    raise
+                logger.warning({
+                    "event": "external_image_upstream_retry",
+                    "path": request.url.path,
+                    "attempt": attempt + 1,
+                    "max_retries": IMAGE_UPSTREAM_RETRIES,
+                })
+                await asyncio.sleep(IMAGE_UPSTREAM_RETRY_DELAY_SECONDS * (attempt + 1))
+        assert response is not None
     except httpx.RequestError:
         await client.aclose()
         return JSONResponse(status_code=502, content={"error": "External model upstream unavailable"})
