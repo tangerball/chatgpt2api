@@ -32,8 +32,6 @@ MAX_MIRROR_RESPONSE_BYTES = 128 * 1024 * 1024
 MAX_MIRROR_IMAGE_BYTES = 64 * 1024 * 1024
 UPSTREAM_MODEL_PREFIX = "upstream/"
 MODEL_CATALOG_TTL_SECONDS = 60
-LEGACY_GPT_IMAGE_MODELS = {"gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5", "gpt-image-2"}
-COMPLEXITY_IMAGE_MODELS = ("gpt-image-2.5-sunburst", "gpt-image-2.5-flare")
 _model_catalog_lock = RLock()
 _model_catalog_cache: dict[str, object] = {"base_url": "", "expires_at": 0.0, "models": {}}
 
@@ -218,6 +216,7 @@ async def forward(request: Request, upstream: dict[str, object], request_body: b
     )
     try:
         response = None
+        response_body = None
         for attempt in range(IMAGE_UPSTREAM_RETRIES + 1):
             outbound = client.build_request(
                 request.method,
@@ -227,8 +226,13 @@ async def forward(request: Request, upstream: dict[str, object], request_body: b
             )
             try:
                 response = await client.send(outbound, stream=True)
+                if request.url.path in IMAGE_ENDPOINTS:
+                    response_body = await _read_limited(response, MAX_MIRROR_RESPONSE_BYTES)
                 break
             except httpx.RequestError:
+                if response is not None:
+                    await response.aclose()
+                    response = None
                 if request.url.path not in IMAGE_ENDPOINTS or attempt >= IMAGE_UPSTREAM_RETRIES:
                     raise
                 logger.warning({
@@ -240,12 +244,13 @@ async def forward(request: Request, upstream: dict[str, object], request_body: b
                 await asyncio.sleep(IMAGE_UPSTREAM_RETRY_DELAY_SECONDS * (attempt + 1))
         assert response is not None
     except httpx.RequestError:
+        if response is not None:
+            await response.aclose()
         await client.aclose()
         return JSONResponse(status_code=502, content={"error": "External model upstream unavailable"})
 
     if request.url.path in IMAGE_ENDPOINTS:
         try:
-            response_body = await _read_limited(response, MAX_MIRROR_RESPONSE_BYTES)
             error_headers = {
                 name: value
                 for name in ("content-type", "retry-after")
@@ -269,8 +274,6 @@ async def forward(request: Request, upstream: dict[str, object], request_body: b
                 headers=error_headers,
                 background=BackgroundTask(_mirror_images, response_body, base_url),
             )
-        except httpx.RequestError:
-            return JSONResponse(status_code=502, content={"error": "External model upstream unavailable"})
         finally:
             await response.aclose()
             await client.aclose()
@@ -478,9 +481,9 @@ def _upstream_image_error(response: Response, api_key: str) -> str:
     return f"External image upstream returned HTTP {response.status_code}: {message}"
 
 
-def _image_complexity_rejected(status: int, body: bytes, model: str) -> bool:
-    """Recognize the gateway's incompatible legacy-model complexity default."""
-    if status != 400 or model not in LEGACY_GPT_IMAGE_MODELS:
+def _image_complexity_rejected(status: int, body: bytes) -> bool:
+    """Recognize an explicit upstream rejection of the requested complexity."""
+    if status != 400:
         return False
     try:
         payload = json.loads(body)
@@ -496,11 +499,50 @@ def _image_complexity_rejected(status: int, body: bytes, model: str) -> bool:
     )
 
 
-def _complexity_retry_model(models: dict[str, object] | None) -> str | None:
-    return next((model for model in COMPLEXITY_IMAGE_MODELS if model in (models or {})), None)
+def _is_image_generation_model(model_id: str, metadata: object) -> bool:
+    if "image" in model_id.casefold():
+        return True
+    if not isinstance(metadata, dict):
+        return False
+
+    for field in ("type", "task", "tasks", "capabilities", "supported_endpoints", "endpoints"):
+        value = metadata.get(field)
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, (list, tuple, set)):
+            values = [item for item in value if isinstance(item, str)]
+        elif isinstance(value, dict):
+            values = [str(key) for key, enabled in value.items() if enabled]
+        else:
+            continue
+        normalized = [item.casefold().replace("-", "_") for item in values]
+        if field in {"supported_endpoints", "endpoints"}:
+            if any("/images/generations" in item or "/images/edits" in item for item in normalized):
+                return True
+        elif any(item in {"image", "images", "image_generation", "images_generation"} for item in normalized):
+            return True
+    return False
 
 
-def _sync_complexity_retry_model(client: httpx.Client, base_url: str, headers: dict[str, str]) -> str | None:
+def _complexity_retry_model(
+    models: dict[str, object] | None,
+    requested_model: str,
+) -> str | None:
+    catalog = models or {}
+    if requested_model not in catalog:
+        return None
+    return next((
+        model_id for model_id, metadata in catalog.items()
+        if model_id != requested_model and _is_image_generation_model(model_id, metadata)
+    ), None)
+
+
+def _sync_complexity_retry_model(
+    client: httpx.Client,
+    base_url: str,
+    headers: dict[str, str],
+    requested_model: str,
+) -> str | None:
     try:
         response = client.get(base_url + "/v1/models", headers=headers)
         payload = response.json()
@@ -509,7 +551,7 @@ def _sync_complexity_retry_model(client: httpx.Client, base_url: str, headers: d
         return _complexity_retry_model({
             item["id"]: item for item in payload["data"]
             if isinstance(item, dict) and isinstance(item.get("id"), str)
-        })
+        }, requested_model)
     except (httpx.RequestError, ValueError):
         return None
 
@@ -576,9 +618,9 @@ def handle_image_task(payload: dict[str, object], mode: str) -> dict[str, object
                             "max_retries": IMAGE_UPSTREAM_RETRIES,
                         })
                         time.sleep(IMAGE_UPSTREAM_RETRY_DELAY_SECONDS * (connection_attempt + 1))
-                if attempt or not _image_complexity_rejected(response.status_code, response.content, model):
+                if attempt or not _image_complexity_rejected(response.status_code, response.content):
                     break
-                retry_model = _sync_complexity_retry_model(client, base_url, headers)
+                retry_model = _sync_complexity_retry_model(client, base_url, headers, model)
                 if retry_model is None:
                     break
                 logger.warning({
@@ -665,8 +707,8 @@ class ExternalUpstreamMiddleware:
 
         forwarded_request = Request(scope, _replay_body(upstream_body, receive))
         response = await forward(forwarded_request, upstream, upstream_body)
-        if image_request and _image_complexity_rejected(response.status_code, getattr(response, "body", b""), model):
-            retry_model = _complexity_retry_model(await _fetch_upstream_models(upstream))
+        if image_request and _image_complexity_rejected(response.status_code, getattr(response, "body", b"")):
+            retry_model = _complexity_retry_model(await _fetch_upstream_models(upstream), model)
             retry_body = _replace_model_in_body(
                 upstream_body, request.headers.get("content-type", ""), retry_model,
             ) if retry_model else None

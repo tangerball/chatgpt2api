@@ -22,6 +22,18 @@ INPUT = {"model": "gpt-image-1", "prompt": "海报", "n": 1,
          "size": "1024x1024", "output_format": "png"}
 
 
+class InterruptedResponseBody(httpx.AsyncByteStream):
+    def __init__(self, request):
+        self.request = request
+
+    async def __aiter__(self):
+        yield b'{"data":'
+        raise httpx.ReadError("connection reset while reading response", request=self.request)
+
+    async def aclose(self):
+        pass
+
+
 class ImageCompatibilityTests(unittest.TestCase):
     def setUp(self):
         self.requests = []
@@ -33,6 +45,7 @@ class ImageCompatibilityTests(unittest.TestCase):
         self.retry_body = SUCCESS
         self.local_calls = 0
         self.transient_error_once = False
+        self.response_read_error_once = False
         upstream._model_catalog_cache.update({"base_url": "", "expires_at": 0.0, "models": {}})
 
         def handle(request):
@@ -42,8 +55,13 @@ class ImageCompatibilityTests(unittest.TestCase):
                 self.transient_error_once = False
                 raise httpx.ConnectError("connection reset", request=request)
             if request.url.path == "/v1/models":
-                return httpx.Response(self.catalog_status, json={"data": [{"id": x} for x in self.catalog]})
+                return httpx.Response(self.catalog_status, json={
+                    "data": [dict(item) if isinstance(item, dict) else {"id": item} for item in self.catalog],
+                })
             image_calls = [r for r, _ in self.requests if r.url.path in upstream.IMAGE_ENDPOINTS]
+            if self.response_read_error_once and len(image_calls) == 1:
+                self.response_read_error_once = False
+                return httpx.Response(200, stream=InterruptedResponseBody(request))
             status, payload = (self.first_status, self.first_body) if len(image_calls) == 1 else (self.retry_status, self.retry_body)
             return httpx.Response(status, json=payload)
 
@@ -134,11 +152,22 @@ class ImageCompatibilityTests(unittest.TestCase):
 
     def test_unknown_model_is_not_substituted(self):
         self.assertEqual(self.generate(model="some-other-image-model").status_code, 429)
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.image_requests()), 1)
 
-    def test_new_image_model_is_not_retried(self):
-        self.assertEqual(self.generate(model="gpt-image-2.5-flare").status_code, 429)
-        self.assertEqual(len(self.requests), 1)
+    def test_new_catalogued_image_model_can_retry_without_a_static_model_list(self):
+        self.catalog = ["image-render-alpha", "image-render-beta"]
+        response = self.generate(model="image-render-beta")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(self.image_requests()[1][1])["model"], "image-render-alpha")
+
+    def test_retry_candidate_is_discovered_from_endpoint_metadata(self):
+        self.catalog = [
+            {"id": "render-v9", "supported_endpoints": ["/v1/images/generations", "/v1/images/edits"]},
+            {"id": "gpt-image-1"},
+        ]
+        response = self.generate()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(self.image_requests()[1][1])["model"], "render-v9")
 
     def test_unlisted_model_is_never_used(self):
         self.catalog = ["gpt-image-1"]
@@ -146,7 +175,7 @@ class ImageCompatibilityTests(unittest.TestCase):
         self.assertEqual(len(self.image_requests()), 1)
 
     def test_flare_used_only_when_listed_and_sunburst_absent(self):
-        self.catalog = ["gpt-image-2.5-flare"]
+        self.catalog = ["gpt-image-1", "gpt-image-2.5-flare"]
         self.assertEqual(self.generate().status_code, 200)
         self.assertEqual(json.loads(self.image_requests()[1][1])["model"], "gpt-image-2.5-flare")
 
@@ -206,6 +235,19 @@ class ImageCompatibilityTests(unittest.TestCase):
             files={"image": ("source.png", b"image-bytes", "image/png")},
         )
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.image_requests()), 2)
+        self.assertEqual(self.local_calls, 0)
+
+    def test_middleware_retries_when_image_response_body_disconnects(self):
+        self.response_read_error_once = True
+        self.first_status, self.first_body = 200, SUCCESS
+        response = self.client.post(
+            "/v1/images/edits",
+            data={"model": "gpt-image-1", "prompt": "edit"},
+            files={"image": ("source.png", b"image-bytes", "image/png")},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), SUCCESS)
         self.assertEqual(len(self.image_requests()), 2)
         self.assertEqual(self.local_calls, 0)
 
